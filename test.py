@@ -3,14 +3,14 @@ import argparse
 import torch
 import cv2
 import numpy as np
-
+from model import *
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Test')
-    parser.add_argument('--is_save', action='store_true', help='Save images')
-    parser.add_argument('--data_in_path', type=str, default="./Data/")
+    parser.add_argument('--is_save', action='store_true', default=True,help='Save images')
+    parser.add_argument('--data_in_path', type=str, default="./Data/Val_Input_Low_Light_2025/Input/")
     parser.add_argument('--data_output_dir_path', type=str, default='./model_output/')
-    parser.add_argument('--ckpt_path', type=str, default='./checkpoint/best.pt', help='Path to model checkpoint')
+    parser.add_argument('--ckpt_path', type=str, default='./LYT_Torch_Weights/best_model_LOLv1.pth', help='Path to model checkpoint')
     args = parser.parse_args()
     return args
 
@@ -24,6 +24,7 @@ class InfranceCode:
         if self.args.is_save:
             self.output_path = self.args.data_output_dir_path
             os.makedirs(self.output_path, exist_ok=True)
+            print("File Created !!")
 
         # Load the model
         self.get_model()
@@ -31,11 +32,9 @@ class InfranceCode:
     def get_model(self):
         """Loads the pre-trained model from checkpoint"""
         # Define the model architecture (should match the saved checkpoint model)
-        self.model = torch.nn.Module()  # Replace with actual model class
-
+        self.model = LYT()
         # Load model weights
-        weight = torch.load(self.args.ckpt_path,
-                            map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        weight = torch.load(self.args.ckpt_path,map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.load_state_dict(weight)
         self.model = self.model.cuda() if torch.cuda.is_available() else self.model.cpu()
         self.model.eval()
@@ -72,6 +71,7 @@ class InfranceCode:
         for h_idx in h_idx_list:
             for w_idx in w_idx_list:
                 in_patch = input_[..., h_idx:h_idx + tile, w_idx:w_idx + tile]
+                #print("out_patch : ", in_patch.shape)
                 out_patch = self.model(in_patch)
                 out_patch_mask = torch.ones_like(out_patch)
 
@@ -120,6 +120,7 @@ class InfranceCode:
                 model_output = self.post_process(model_output)
 
                 if self.args.is_save:
+                    print("Save : ", image_name)
                     self.save_image(image_name, model_output)
 
 
