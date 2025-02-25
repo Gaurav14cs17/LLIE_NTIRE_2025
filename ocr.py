@@ -67,6 +67,5 @@ class AttentionOCR(nn.Module):
                 input_char = targets[:, t]
             else:
                 input_char = char_output.argmax(dim=-1)
-
         return torch.stack(outputs, dim=1)  # (B, max_length, num_classes)
 
