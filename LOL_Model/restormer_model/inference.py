@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import warnings
+from einops import rearrange
+from torch.nn.init import _calculate_fan_in_and_fan_out
+from torch.nn.init import trunc_normal_
 
+# Define KANLinear (Kolmogorov–Arnold Network Layer)
 class KANLinear(nn.Module):
     def __init__(
         self,
@@ -97,6 +102,113 @@ class KANLinear(nn.Module):
         )
         return base_output + spline_output
 
+# Define IGAB (Illumination-Guided Attention Block)
+class IGAB(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_head=64,
+        heads=8,
+        num_blocks=2,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList([])
+        for _ in range(num_blocks):
+            self.blocks.append(nn.ModuleList([
+                IG_MSA(dim=dim, dim_head=dim_head, heads=heads),
+                PreNorm(dim, FeedForward(dim=dim))
+            ]))
+
+    def forward(self, x, illu_fea):
+        x = x.permute(0, 2, 3, 1)
+        for (attn, ff) in self.blocks:
+            x = attn(x, illu_fea_trans=illu_fea.permute(0, 2, 3, 1)) + x
+            x = ff(x) + x
+        out = x.permute(0, 3, 1, 2)
+        return out
+
+# Define IG_MSA (Illumination-Guided Multi-Head Self-Attention)
+class IG_MSA(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_head=64,
+        heads=8,
+    ):
+        super().__init__()
+        self.num_heads = heads
+        self.dim_head = dim_head
+        self.to_q = nn.Linear(dim, dim_head * heads, bias=False)
+        self.to_k = nn.Linear(dim, dim_head * heads, bias=False)
+        self.to_v = nn.Linear(dim, dim_head * heads, bias=False)
+        self.rescale = nn.Parameter(torch.ones(heads, 1, 1))
+        self.proj = nn.Linear(dim_head * heads, dim, bias=True)
+        self.pos_emb = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1, bias=False, groups=dim),
+            GELU(),
+            nn.Conv2d(dim, dim, 3, 1, 1, bias=False, groups=dim),
+        )
+        self.dim = dim
+
+    def forward(self, x_in, illu_fea_trans):
+        b, h, w, c = x_in.shape
+        x = x_in.reshape(b, h * w, c)
+        q_inp = self.to_q(x)
+        k_inp = self.to_k(x)
+        v_inp = self.to_v(x)
+        illu_attn = illu_fea_trans
+        q, k, v, illu_attn = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads),
+                                 (q_inp, k_inp, v_inp, illu_attn.flatten(1, 2)))
+        v = v * illu_attn
+        q = q.transpose(-2, -1)
+        k = k.transpose(-2, -1)
+        v = v.transpose(-2, -1)
+        q = F.normalize(q, dim=-1, p=2)
+        k = F.normalize(k, dim=-1, p=2)
+        attn = (k @ q.transpose(-2, -1))
+        attn = attn * self.rescale
+        attn = attn.softmax(dim=-1)
+        x = attn @ v
+        x = x.permute(0, 3, 1, 2)
+        x = x.reshape(b, h * w, self.num_heads * self.dim_head)
+        out_c = self.proj(x).view(b, h, w, c)
+        out_p = self.pos_emb(v_inp.reshape(b, h, w, c).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        out = out_c + out_p
+        return out
+
+# Define FeedForward (Feed-Forward Network)
+class FeedForward(nn.Module):
+    def __init__(self, dim, mult=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, dim * mult, 1, 1, bias=False),
+            GELU(),
+            nn.Conv2d(dim * mult, dim * mult, 3, 1, 1, bias=False, groups=dim * mult),
+            GELU(),
+            nn.Conv2d(dim * mult, dim, 1, 1, bias=False),
+        )
+
+    def forward(self, x):
+        out = self.net(x.permute(0, 3, 1, 2))
+        return out.permute(0, 2, 3, 1)
+
+# Define PreNorm (Pre-Normalization)
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x, *args, **kwargs):
+        x = self.norm(x)
+        return self.fn(x, *args, **kwargs)
+
+# Define GELU (Gaussian Error Linear Unit)
+class GELU(nn.Module):
+    def forward(self, x):
+        return F.gelu(x)
+
+# Define Denoiser (Main Denoising Module)
 class Denoiser(nn.Module):
     def __init__(self, in_dim=20, out_dim=3, dim=31, level=2, num_blocks=[2, 4, 4]):
         super(Denoiser, self).__init__()
@@ -144,7 +256,6 @@ class Denoiser(nn.Module):
         self.apply(self._init_weights)
 
         self.criterion = nn.L1Loss(reduction='mean')
-        self.spy_lap = PyLap(4)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -156,12 +267,6 @@ class Denoiser(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x, illu_fea):
-        """
-        x:          [b,c,h,w]         x is feature, not image
-        illu_fea:   [b,c,h,w]
-        return out: [b,c,h,w]
-        """
-
         # Embedding
         fea = self.embedding(x)
 
@@ -169,7 +274,7 @@ class Denoiser(nn.Module):
         fea_encoder = []
         illu_fea_list = []
         for (IGAB, FeaDownSample, IlluFeaDownsample) in self.encoder_layers:
-            fea = IGAB(fea, illu_fea)  # bchw
+            fea = IGAB(fea, illu_fea)
             illu_fea_list.append(illu_fea)
             fea_encoder.append(fea)
             fea = FeaDownSample(fea)
