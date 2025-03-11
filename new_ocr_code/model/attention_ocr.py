@@ -1,97 +1,123 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
+import torch.nn.functional as F
+from torchvision.models.inception import BasicConv2d, InceptionA
 
 
-class AttentionOCR(nn.Module):
-    def __init__(self, num_classes=10, hidden_size=256, embed_size=256):
-        super(AttentionOCR, self).__init__()
-        # Store hidden_size as an instance variable
+class InceptNet(nn.Module):
+    def __init__(self, input_channels=1):
+        super(InceptNet, self).__init__()
+
+        # Convolutional layers
+        self.conv_layers = nn.Sequential(
+            BasicConv2d(input_channels, 32, kernel_size=3, stride=2),
+            BasicConv2d(32, 32, kernel_size=3),
+            BasicConv2d(32, 64, kernel_size=3, padding=1),
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            BasicConv2d(64, 80, kernel_size=1),
+            BasicConv2d(80, 192, kernel_size=3),
+            nn.MaxPool2d(kernel_size=3, stride=2),
+        )
+
+        # Inception blocks
+        self.inception_blocks = nn.Sequential(
+            InceptionA(192, pool_features=32),
+            InceptionA(256, pool_features=64),
+            InceptionA(288, pool_features=64),
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)  # Apply convolutional layers
+        x = self.inception_blocks(x)  # Apply inception blocks
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, max_len, hidden_size, sos_id, eos_id):
+        super(Decoder, self).__init__()
+        self.vocab_size = vocab_size
+        self.max_len = max_len
         self.hidden_size = hidden_size
-        self.embed_size = embed_size
+        self.sos_id = sos_id
+        self.eos_id = eos_id
 
-        # Feature extractor (ResNet18 without the final FC layers)
-        base_model = models.resnet18(pretrained=True)
-        self.feature_extractor = nn.Sequential(*list(base_model.children())[:-2])  # Remove FC and avgpool layers
+        # Embedding layer
+        self.emb = nn.Embedding(vocab_size, hidden_size)
 
-        # Linear layer to project ResNet features to hidden_size
-        self.fc = nn.Linear(512, hidden_size)
-
-        # Embedding layer for target characters
-        self.embedding = nn.Embedding(num_classes, embed_size)
-
-        # Attention mechanism
-        self.attn = nn.Linear(hidden_size + embed_size, hidden_size)
-        self.attn_combine = nn.Linear(hidden_size + embed_size, hidden_size)
-
-        # LSTM Decoder
-        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        # GRU layer
+        self.rnn = nn.GRU(hidden_size, hidden_size, batch_first=True)
 
         # Output layer
-        self.fc_out = nn.Linear(hidden_size, num_classes)
+        self.out = nn.Linear(hidden_size, vocab_size)
 
-    def forward(self, images, targets=None, max_length=30):
-        # Extract features from the image using ResNet
-        features = self.feature_extractor(images)  # (B, 512, H, W)
-        b, c, h, w = features.size()
-        features = features.view(b, c, h * w).permute(0, 2, 1)  # (B, H*W, 512)
-        features = self.fc(features)  # (B, H*W, hidden_size)
+    def forward(self, inputs, hidden):
+        # Embed the input
+        embedded = self.emb(inputs)
 
-        # Initialize hidden state and cell state for LSTM
-        hidden = torch.zeros(1, b, self.hidden_size).to(images.device)  # (1, B, hidden_size)
-        cell = torch.zeros(1, b, self.hidden_size).to(images.device)  # (1, B, hidden_size)
+        # Pass through GRU
+        outputs, hidden = self.rnn(embedded, hidden)
 
-        # Start token (all zeros)
-        input_char = torch.zeros(b, dtype=torch.long).to(images.device)  # (B,)
+        # Apply output layer
+        outputs = self.out(outputs)
+        return outputs, hidden
 
-        # Store outputs
-        outputs = []
 
-        for t in range(max_length):
-            # Embed the input character
-            embedded = self.embedding(input_char)  # (B, embed_size)
+class OCR_Model(nn.Module):
+    def __init__(self, img_width, img_height, nh, n_classes, max_len, SOS_token, EOS_token):
+        super(OCR_Model, self).__init__()
 
-            # Compute attention weights
-            attn_input = torch.cat((hidden.squeeze(0), embedded), dim=-1)  # (B, hidden_size + embed_size)
-            attn_weights = torch.softmax(self.attn(attn_input), dim=-1)  # (B, hidden_size)
+        # Feature extractor
+        self.incept_model = InceptNet(input_channels=1)
 
-            # Apply attention to encoder features
-            attn_weights = attn_weights.unsqueeze(2)  # (B, hidden_size, 1)
-            attn_applied = torch.bmm(features, attn_weights).squeeze(2)  # (B, H*W)
+        # Decoder
+        self.decoder = Decoder(n_classes, max_len, nh, SOS_token, EOS_token)
 
-            # Normalize attention weights
-            attn_weights = torch.softmax(attn_applied, dim=-1)  # (B, H*W)
-            attn_weights = attn_weights.unsqueeze(1)  # (B, 1, H*W)
+    def forward(self, input_, target_seq=None, teacher_forcing_ratio=0):
+        # Extract features using InceptNet
+        encoder_outputs = self.incept_model(input_)
 
-            # Compute weighted sum of encoder features
-            attn_applied = torch.bmm(attn_weights, features).squeeze(1)  # (B, hidden_size)
+        # Flatten encoder outputs
+        b, fc, fh, fw = encoder_outputs.size()
+        encoder_outputs = encoder_outputs.view(b, -1, fc)
 
-            # Combine attention context with embedded input
-            rnn_input = torch.cat((embedded, attn_applied), dim=-1)  # (B, embed_size + hidden_size)
-            rnn_input = self.attn_combine(rnn_input).unsqueeze(1)  # (B, 1, hidden_size)
+        # Initialize hidden state for decoder
+        hidden = torch.zeros(1, b, self.decoder.hidden_size, device=input_.device)
 
-            # LSTM step
-            output, (hidden, cell) = self.lstm(rnn_input, (hidden, cell))  # output: (B, 1, hidden_size)
+        # Decode
+        if target_seq is not None and torch.rand(1).item() < teacher_forcing_ratio:
+            # Teacher forcing: use ground truth as input
+            decoder_outputs, _ = self.decoder(target_seq, hidden)
+        else:
+            # Inference: use predicted tokens as input
+            decoder_input = torch.full((b, 1), self.decoder.sos_id, device=input_.device)
+            decoder_outputs = []
+            for _ in range(self.decoder.max_len):
+                decoder_output, hidden = self.decoder(decoder_input, hidden)
+                decoder_outputs.append(decoder_output)
+                decoder_input = decoder_output.argmax(-1)
+            decoder_outputs = torch.cat(decoder_outputs, dim=1)
 
-            # Predict the next character
-            char_output = self.fc_out(output.squeeze(1))  # (B, num_classes)
-            outputs.append(char_output)
-
-            # Prepare the next input character
-            if targets is not None:
-                # Teacher forcing: use the ground truth as the next input
-                input_char = targets[:, t]
-            else:
-                # Inference: use the predicted character as the next input
-                input_char = char_output.argmax(dim=-1)
-
-        # Stack outputs along the time dimension
-        return torch.stack(outputs, dim=1)  # (B, max_length, num_classes)
+        return decoder_outputs
 
 
 if __name__ == '__main__':
-    # Test the model
-    image = torch.randn((1, 3, 256, 256))  # Batch of 1 image
-    model = AttentionOCR()
-    output = model(image)
-    print("Output Shape:", output.shape)  # Should be (1, 30, 10)
+    # Test InceptNet
+    incept_model = InceptNet(input_channels=1)
+    x = torch.randn(1, 1, 160, 60)
+    print("Input shape:", x.shape)
+    f = incept_model(x)
+    print("InceptNet output shape:", f.shape)
+
+    # Test OCR_Model
+    img_width, img_height = 160, 60
+    nh = 512
+    n_classes = 38
+    max_len = 10
+    SOS_token = 0
+    EOS_token = 1
+
+    ocr_model = OCR_Model(img_width, img_height, nh, n_classes, max_len, SOS_token, EOS_token)
+    x = torch.randn(1, 1, img_height, img_width)
+    print("OCR_Model input shape:", x.shape)
+    output = ocr_model(x)
+    print("OCR_Model output shape:", output.shape)
